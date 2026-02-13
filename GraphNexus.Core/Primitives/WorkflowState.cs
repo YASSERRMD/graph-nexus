@@ -7,6 +7,7 @@ public sealed record WorkflowState
 {
     public required string Id { get; init; }
     public required string WorkflowId { get; init; }
+    public required string ThreadId { get; init; }
     public int Step { get; init; }
     public IReadOnlyDictionary<string, object?> Data { get; init; } = new Dictionary<string, object?>();
     public IReadOnlyList<Message> Messages { get; init; } = [];
@@ -20,6 +21,7 @@ public sealed record WorkflowState
     public WorkflowState(
         string id,
         string workflowId,
+        string threadId,
         int step,
         IReadOnlyDictionary<string, object?> data,
         IReadOnlyList<Message> messages,
@@ -31,6 +33,7 @@ public sealed record WorkflowState
     {
         Id = id;
         WorkflowId = workflowId;
+        ThreadId = threadId;
         Step = step;
         Data = data;
         Messages = messages;
@@ -41,12 +44,13 @@ public sealed record WorkflowState
         Error = error;
     }
 
-    public static WorkflowState Create(string workflowId)
+    public static WorkflowState Create(string workflowId, string? threadId = null)
     {
         var now = DateTimeOffset.UtcNow;
         return new WorkflowState(
             Guid.NewGuid().ToString(),
             workflowId,
+            threadId ?? Guid.NewGuid().ToString(),
             0,
             new Dictionary<string, object?>(),
             new List<Message>(),

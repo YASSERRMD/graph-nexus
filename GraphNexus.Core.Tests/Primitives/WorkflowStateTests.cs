@@ -20,6 +20,7 @@ public class WorkflowStateTests
 
         Assert.NotNull(state.Id);
         Assert.Equal("workflow-1", state.WorkflowId);
+        Assert.NotNull(state.ThreadId);
         Assert.Equal(0, state.Step);
         Assert.Empty(state.Data);
         Assert.Empty(state.Messages);
@@ -29,11 +30,20 @@ public class WorkflowStateTests
     }
 
     [Fact]
+    public void WorkflowState_Create_WithThreadId_ShouldUseProvidedThreadId()
+    {
+        var state = WorkflowState.Create("workflow-1", "thread-123");
+
+        Assert.Equal("thread-123", state.ThreadId);
+    }
+
+    [Fact]
     public void WorkflowState_SerializationRoundtrip_ShouldPreserveData()
     {
         var state = new WorkflowState(
             "state-123",
             "workflow-1",
+            "thread-456",
             5,
             new Dictionary<string, object?> { ["key"] = "value" },
             new List<Message> { Message.Create("user", "Hello") },
@@ -50,6 +60,7 @@ public class WorkflowStateTests
         Assert.NotNull(deserialized);
         Assert.Equal(state.Id, deserialized.Id);
         Assert.Equal(state.WorkflowId, deserialized.WorkflowId);
+        Assert.Equal(state.ThreadId, deserialized.ThreadId);
         Assert.Equal(state.Step, deserialized.Step);
         Assert.Equal("value", deserialized.Data["key"]);
         Assert.Single(deserialized.Messages);
@@ -60,7 +71,7 @@ public class WorkflowStateTests
     [Fact]
     public void WorkflowState_WithStep_ShouldReturnNewInstance()
     {
-        var original = WorkflowState.Create("workflow-1");
+        var original = WorkflowState.Create("workflow-1", "thread-1");
         var updated = original.WithStep(10);
 
         Assert.NotSame(original, updated);
@@ -71,7 +82,7 @@ public class WorkflowStateTests
     [Fact]
     public void WorkflowState_WithData_ShouldMergeData()
     {
-        var original = WorkflowState.Create("workflow-1")
+        var original = WorkflowState.Create("workflow-1", "thread-1")
             .WithData("key1", "value1");
         var updated = original.WithData("key2", "value2");
 
@@ -82,7 +93,7 @@ public class WorkflowStateTests
     [Fact]
     public void WorkflowState_WithMessage_ShouldAppendMessage()
     {
-        var original = WorkflowState.Create("workflow-1");
+        var original = WorkflowState.Create("workflow-1", "thread-1");
         var message = Message.Create("user", "Test message");
         var updated = original.WithMessage(message);
 
@@ -94,7 +105,7 @@ public class WorkflowStateTests
     [Fact]
     public void WorkflowState_WithStatus_ShouldUpdateStatusAndError()
     {
-        var original = WorkflowState.Create("workflow-1");
+        var original = WorkflowState.Create("workflow-1", "thread-1");
         var failed = original.WithStatus(WorkflowStatus.Failed, "Something went wrong");
 
         Assert.Equal(WorkflowStatus.Running, original.Status);
