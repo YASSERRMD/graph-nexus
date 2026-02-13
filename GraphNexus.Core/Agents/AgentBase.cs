@@ -1,4 +1,5 @@
 using System.Text.Json;
+using GraphNexus.Agents.Policies;
 using GraphNexus.Core.Nodes;
 using GraphNexus.Nodes;
 using GraphNexus.Primitives;
@@ -11,6 +12,7 @@ public abstract class AgentBase : INode
     protected readonly IReadOnlyList<INode> Tools;
     protected readonly IMemorySelector MemorySelector;
     protected readonly string SystemPrompt;
+    protected readonly IReadOnlyList<IPolicy>? Policies;
 
     public string Id { get; }
     public string Name { get; }
@@ -21,24 +23,36 @@ public abstract class AgentBase : INode
         ILlmClient llmClient,
         IReadOnlyList<INode>? tools = null,
         IMemorySelector? memorySelector = null,
-        string? systemPrompt = null)
+        string? systemPrompt = null,
+        IReadOnlyList<IPolicy>? policies = null)
     {
+        ArgumentNullException.ThrowIfNull(id);
+        ArgumentNullException.ThrowIfNull(llmClient);
+
         Id = id;
         Name = name;
         LlmClient = llmClient;
         Tools = tools ?? [];
         MemorySelector = memorySelector ?? new LastNMessagesSelector(10);
         SystemPrompt = systemPrompt ?? GetDefaultSystemPrompt();
+        Policies = policies;
     }
 
     public async Task<NodeResult> ExecuteAsync(WorkflowState state, CancellationToken cancellationToken = default)
     {
         try
         {
-            var messages = new List<Message>(MemorySelector.Select(state));
-
             var prompt = BuildAgentPrompt(state);
-            messages.Add(Message.Create("user", prompt));
+
+            var userMessage = Message.Create("user", prompt);
+            var validationResult = await ValidateMessageAsync(userMessage, cancellationToken);
+            if (!validationResult.IsAllowed)
+            {
+                return new FailureResult(Id, Guid.NewGuid().ToString(), validationResult.Reason ?? "Message rejected by policy", null);
+            }
+
+            var messages = new List<Message>(MemorySelector.Select(state));
+            messages.Add(userMessage);
 
             var request = new LlmRequest
             {
@@ -51,9 +65,16 @@ public abstract class AgentBase : INode
 
             var response = await LlmClient.GenerateAsync(request, cancellationToken);
 
+            var assistantMessage = Message.Create("assistant", response.Content);
+            var responseValidation = await ValidateMessageAsync(assistantMessage, cancellationToken);
+            if (!responseValidation.IsAllowed)
+            {
+                return new FailureResult(Id, Guid.NewGuid().ToString(), responseValidation.Reason ?? "Response rejected by policy", null);
+            }
+
             var newState = state
                 .WithData("agent_response", response.Content)
-                .WithMessage(Message.Create("assistant", response.Content));
+                .WithMessage(assistantMessage);
 
             if (response.ToolCalls != null && response.ToolCalls.Count > 0)
             {
@@ -80,6 +101,25 @@ public abstract class AgentBase : INode
         {
             return new FailureResult(Id, Guid.NewGuid().ToString(), ex.Message, ex.ToString());
         }
+    }
+
+    private async Task<PolicyResult> ValidateMessageAsync(Message message, CancellationToken cancellationToken)
+    {
+        if (Policies == null || Policies.Count == 0)
+        {
+            return PolicyResult.Allowed();
+        }
+
+        foreach (var policy in Policies)
+        {
+            var result = await policy.ValidateAsync(message, cancellationToken);
+            if (!result.IsAllowed)
+            {
+                return result;
+            }
+        }
+
+        return PolicyResult.Allowed();
     }
 
     public IReadOnlyList<string> GetInputKeys() => [];

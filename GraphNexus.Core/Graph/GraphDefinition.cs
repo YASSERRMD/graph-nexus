@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -8,6 +9,8 @@ namespace GraphNexus.Graph;
 
 public sealed class GraphDefinition
 {
+    private readonly Lazy<IReadOnlyList<string>> _validationResult;
+
     public string Id { get; }
     public string Name { get; }
     public IReadOnlyDictionary<string, INode> Nodes { get; }
@@ -29,6 +32,8 @@ public sealed class GraphDefinition
         Edges = edges;
         EntryNodeId = entryNodeId ?? nodes.Keys.FirstOrDefault();
         ExitNodeIds = exitNodeIds ?? nodes.Keys.Where(k => !edges.Any(e => e.SourceNodeId == k)).ToList();
+
+        _validationResult = new Lazy<IReadOnlyList<string>>(ComputeValidation);
     }
 
     public IReadOnlyList<Edge> GetOutgoingEdges(string nodeId)
@@ -66,7 +71,9 @@ public sealed class GraphDefinition
         return visited;
     }
 
-    public IReadOnlyList<string> Validate()
+    public IReadOnlyList<string> Validate() => _validationResult.Value;
+
+    private IReadOnlyList<string> ComputeValidation()
     {
         var errors = new List<string>();
 
@@ -93,11 +100,14 @@ public sealed class GraphDefinition
             }
         }
 
-        var reachable = GetReachableNodes(EntryNodeId!);
-        var unreachable = nodeIds.Except(reachable);
-        if (unreachable.Any())
+        if (!string.IsNullOrEmpty(EntryNodeId))
         {
-            errors.Add($"Unreachable nodes found: {string.Join(", ", unreachable)}");
+            var reachable = GetReachableNodes(EntryNodeId);
+            var unreachable = nodeIds.Except(reachable);
+            if (unreachable.Any())
+            {
+                errors.Add($"Unreachable nodes found: {string.Join(", ", unreachable)}");
+            }
         }
 
         var cycles = DetectCycles();

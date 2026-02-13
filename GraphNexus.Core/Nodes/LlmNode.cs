@@ -12,6 +12,7 @@ public sealed class LlmNode : INode
     private readonly string _outputKey;
     private readonly double? _temperature;
     private readonly int? _maxTokens;
+    private readonly int _maxInputLength;
 
     public string Id { get; }
     public string Name { get; }
@@ -24,8 +25,13 @@ public sealed class LlmNode : INode
         string? model = null,
         string outputKey = "llm_output",
         double? temperature = null,
-        int? maxTokens = null)
+        int? maxTokens = null,
+        int maxInputLength = 100000)
     {
+        ArgumentNullException.ThrowIfNull(id);
+        ArgumentNullException.ThrowIfNull(client);
+        ArgumentNullException.ThrowIfNull(promptTemplate);
+
         Id = id;
         Name = name;
         _client = client;
@@ -34,6 +40,7 @@ public sealed class LlmNode : INode
         _outputKey = outputKey;
         _temperature = temperature;
         _maxTokens = maxTokens;
+        _maxInputLength = maxInputLength;
     }
 
     public async Task<NodeResult> ExecuteAsync(WorkflowState state, CancellationToken cancellationToken = default)
@@ -75,9 +82,29 @@ public sealed class LlmNode : INode
         foreach (var (key, value) in state.Data)
         {
             var placeholder = $"{{{{{key}}}}}";
-            template = template.Replace(placeholder, value?.ToString() ?? "");
+            var sanitizedValue = SanitizeValue(value?.ToString() ?? "");
+            template = template.Replace(placeholder, sanitizedValue);
         }
         return template;
+    }
+
+    private string SanitizeValue(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return value;
+
+        var sanitized = value
+            .Replace("{{", "")
+            .Replace("}}", "")
+            .Replace("\u0000", "")
+            .Replace("\u200B", "");
+
+        if (sanitized.Length > _maxInputLength)
+        {
+            sanitized = sanitized[.._maxInputLength] + "... [truncated]";
+        }
+
+        return sanitized;
     }
 
     private static IReadOnlyList<string> ExtractTemplateVariables(string template)
