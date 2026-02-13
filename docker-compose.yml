@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: graphnexus-postgres
+    environment:
+      POSTGRES_USER: graphnexus
+      POSTGRES_PASSWORD: graphnexus
+      POSTGRES_DB: graphnexus
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U graphnexus"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: graphnexus-api
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: "Host=postgres;Database=graphnexus;Username=graphnexus;Password=graphnexus"
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
