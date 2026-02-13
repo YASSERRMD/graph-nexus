@@ -6,15 +6,22 @@ namespace GraphNexus.Core.Tests.Nodes;
 
 public class MockLlmClient : ILlmClient
 {
-    public string ResponseToReturn { get; set; } = "Mock response";
+    public LlmResponse? ResponseToReturn { get; set; } = new LlmResponse { Content = "Mock response" };
     public int InvokeCount { get; private set; }
-    public string? LastPrompt { get; private set; }
+    public LlmRequest? LastRequest { get; private set; }
 
-    public Task<string> GenerateAsync(string prompt, string? model = null, CancellationToken cancellationToken = default)
+    public async Task<LlmResponse> GenerateAsync(LlmRequest request, CancellationToken cancellationToken = default)
     {
         InvokeCount++;
-        LastPrompt = prompt;
-        return Task.FromResult(ResponseToReturn);
+        LastRequest = request;
+        await Task.CompletedTask;
+        return ResponseToReturn!;
+    }
+
+    public async IAsyncEnumerable<string> GenerateStreamingAsync(LlmRequest request, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        await Task.CompletedTask;
+        yield return "Mock";
     }
 }
 
@@ -23,7 +30,7 @@ public class LlmNodeTests
     [Fact]
     public async Task ExecuteAsync_ShouldCallLlmClient()
     {
-        var mockClient = new MockLlmClient { ResponseToReturn = "Hello!" };
+        var mockClient = new MockLlmClient { ResponseToReturn = new LlmResponse { Content = "Hello!" } };
         var node = new LlmNode("llm-1", "ChatNode", mockClient, "Say hello");
         var state = WorkflowState.Create("workflow-1");
 
@@ -43,7 +50,8 @@ public class LlmNodeTests
 
         var result = await node.ExecuteAsync(state);
 
-        Assert.Contains("Hello World!", mockClient.LastPrompt);
+        Assert.NotNull(mockClient.LastRequest);
+        Assert.Contains("Hello World!", mockClient.LastRequest.Messages[0].Content);
     }
 
     [Fact]
@@ -59,6 +67,21 @@ public class LlmNodeTests
         var success = (SuccessResult)result;
         Assert.Equal("Mock response", success.OutputState.Data["response"]);
         Assert.False(success.OutputState.Data.ContainsKey("llm_output"));
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WithModelAndTemperature_ShouldPassToClient()
+    {
+        var mockClient = new MockLlmClient();
+        var node = new LlmNode("llm-1", "ChatNode", mockClient, "Prompt", model: "gpt-4", temperature: 0.7, maxTokens: 100);
+        var state = WorkflowState.Create("workflow-1");
+
+        var result = await node.ExecuteAsync(state);
+
+        Assert.NotNull(mockClient.LastRequest);
+        Assert.Equal("gpt-4", mockClient.LastRequest.Model);
+        Assert.Equal(0.7, mockClient.LastRequest.Temperature);
+        Assert.Equal(100, mockClient.LastRequest.MaxTokens);
     }
 
     [Fact]
@@ -87,8 +110,14 @@ public class LlmNodeTests
 
     private class FailingLlmClient : ILlmClient
     {
-        public Task<string> GenerateAsync(string prompt, string? model = null, CancellationToken cancellationToken = default)
+        public Task<LlmResponse> GenerateAsync(LlmRequest request, CancellationToken cancellationToken = default)
         {
+            throw new InvalidOperationException("LLM API failed");
+        }
+
+        public async IAsyncEnumerable<string> GenerateStreamingAsync(LlmRequest request, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.CompletedTask;
             throw new InvalidOperationException("LLM API failed");
         }
     }

@@ -10,6 +10,8 @@ public sealed class LlmNode : INode
     private readonly string _promptTemplate;
     private readonly string? _model;
     private readonly string _outputKey;
+    private readonly double? _temperature;
+    private readonly int? _maxTokens;
 
     public string Id { get; }
     public string Name { get; }
@@ -20,7 +22,9 @@ public sealed class LlmNode : INode
         ILlmClient client,
         string promptTemplate,
         string? model = null,
-        string outputKey = "llm_output")
+        string outputKey = "llm_output",
+        double? temperature = null,
+        int? maxTokens = null)
     {
         Id = id;
         Name = name;
@@ -28,6 +32,8 @@ public sealed class LlmNode : INode
         _promptTemplate = promptTemplate;
         _model = model;
         _outputKey = outputKey;
+        _temperature = temperature;
+        _maxTokens = maxTokens;
     }
 
     public async Task<NodeResult> ExecuteAsync(WorkflowState state, CancellationToken cancellationToken = default)
@@ -35,8 +41,22 @@ public sealed class LlmNode : INode
         try
         {
             var prompt = RenderTemplate(state);
-            var response = await _client.GenerateAsync(prompt, _model, cancellationToken);
-            var newState = state.WithData(_outputKey, response);
+
+            var messages = new List<Message>
+            {
+                Message.Create("user", prompt)
+            };
+
+            var request = new LlmRequest
+            {
+                Messages = messages,
+                Model = _model,
+                Temperature = _temperature,
+                MaxTokens = _maxTokens
+            };
+
+            var response = await _client.GenerateAsync(request, cancellationToken);
+            var newState = state.WithData(_outputKey, response.Content);
 
             return new SuccessResult(Id, Guid.NewGuid().ToString(), newState);
         }
