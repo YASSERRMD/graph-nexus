@@ -9,10 +9,12 @@ namespace GraphNexus.Execution;
 public sealed class ParallelExecutor
 {
     private readonly IStateStore _stateStore;
+    private readonly SemaphoreSlim _concurrencySemaphore;
 
-    public ParallelExecutor(IStateStore stateStore)
+    public ParallelExecutor(IStateStore stateStore, int maxConcurrency = 4)
     {
         _stateStore = stateStore;
+        _concurrencySemaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
     }
 
     public async IAsyncEnumerable<StateEvent> RunAsync(
@@ -32,128 +34,139 @@ public sealed class ParallelExecutor
         var currentState = request.InitialState;
         await _stateStore.SaveStateAsync(currentState, cancellationToken);
 
-        var completedNodes = new HashSet<string>();
-        var pendingNodes = new Queue<string>();
+        var completedNodes = new ConcurrentBag<string>();
+        var pendingNodes = new ConcurrentQueue<string>();
+        var runningTasks = new List<Task>();
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         if (!string.IsNullOrEmpty(request.Graph.EntryNodeId))
         {
             pendingNodes.Enqueue(request.Graph.EntryNodeId);
         }
 
-        while (pendingNodes.Count > 0 && !cancellationToken.IsCancellationRequested)
+        async Task ProcessNodeAsync(string nodeId, CancellationToken ct)
         {
-            var nodeId = pendingNodes.Dequeue();
-
-            if (completedNodes.Contains(nodeId))
-                continue;
-
-            if (!request.Graph.Nodes.TryGetValue(nodeId, out var node))
-                continue;
-
-            var previousHash = StateEventHelpers.ComputeStateHash(currentState);
-
-            var enteredEvent = StateEventHelpers.CreateEnteredEvent(
-                request.ExecutionId,
-                nodeId,
-                currentState,
-                previousHash
-            );
-            context.AddEvent(enteredEvent);
-            yield return enteredEvent;
+            await _concurrencySemaphore.WaitAsync(ct);
 
             try
             {
-                var result = await ExecuteNodeAsync(node, currentState, cancellationToken);
+                if (!request.Graph.Nodes.TryGetValue(nodeId, out var node))
+                    return;
 
-                if (result is SuccessResult success)
+                var previousHash = StateEventHelpers.ComputeStateHash(currentState);
+
+                var enteredEvent = StateEventHelpers.CreateEnteredEvent(
+                    request.ExecutionId,
+                    nodeId,
+                    currentState,
+                    previousHash
+                );
+                context.AddEvent(enteredEvent);
+
+                try
                 {
-                    currentState = success.OutputState.WithStep(currentState.Step + 1);
-                    await _stateStore.SaveStateAsync(currentState, cancellationToken);
+                    var result = await ExecuteNodeAsync(node, currentState, ct);
 
-                    var exitedEvent = StateEventHelpers.CreateExitedEvent(
-                        request.ExecutionId,
-                        nodeId,
-                        currentState,
-                        previousHash
-                    );
-                    context.AddEvent(exitedEvent);
-                    yield return exitedEvent;
-
-                    completedNodes.Add(nodeId);
-
-                    var outgoingEdges = request.Graph.GetOutgoingEdges(nodeId);
-                    foreach (var edge in outgoingEdges)
+                    if (result is SuccessResult success)
                     {
-                        if (edge.EvaluateCondition(currentState) && !completedNodes.Contains(edge.TargetNodeId))
+                        currentState = success.OutputState.WithStep(currentState.Step + 1);
+                        await _stateStore.SaveStateAsync(currentState, ct);
+
+                        var exitedEvent = StateEventHelpers.CreateExitedEvent(
+                            request.ExecutionId,
+                            nodeId,
+                            currentState,
+                            previousHash
+                        );
+                        context.AddEvent(exitedEvent);
+
+                        completedNodes.Add(nodeId);
+
+                        var outgoingEdges = request.Graph.GetOutgoingEdges(nodeId);
+                        foreach (var edge in outgoingEdges)
                         {
-                            pendingNodes.Enqueue(edge.TargetNodeId);
+                            if (edge.EvaluateCondition(currentState) && !completedNodes.Contains(edge.TargetNodeId))
+                            {
+                                pendingNodes.Enqueue(edge.TargetNodeId);
+                            }
+                        }
+                    }
+                    else if (result is FailureResult failure)
+                    {
+                        var errorEvent = StateEventHelpers.CreateErrorEvent(
+                            request.ExecutionId,
+                            nodeId,
+                            currentState,
+                            new Exception(failure.Error ?? failure.Reason),
+                            previousHash
+                        );
+                        context.AddEvent(errorEvent);
+
+                        if (!request.Options.ContinueOnError)
+                        {
+                            cts.Cancel();
                         }
                     }
                 }
-                else if (result is FailureResult failure)
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
                 {
                     var errorEvent = StateEventHelpers.CreateErrorEvent(
                         request.ExecutionId,
                         nodeId,
                         currentState,
-                        new Exception(failure.Error ?? failure.Reason),
+                        ex,
                         previousHash
                     );
                     context.AddEvent(errorEvent);
-                    yield return errorEvent;
 
                     if (!request.Options.ContinueOnError)
                     {
-                        currentState = currentState.WithStatus(WorkflowStatus.Failed, failure.Error ?? failure.Reason);
-                        await _stateStore.SaveStateAsync(currentState, cancellationToken);
-
-                        var failedEvent = StateEventHelpers.CreateFailedEvent(
-                            request.ExecutionId,
-                            nodeId,
-                            currentState,
-                            failure.Reason
-                        );
-                        context.AddEvent(failedEvent);
-                        yield return failedEvent;
-
-                        yield break;
+                        cts.Cancel();
                     }
                 }
             }
-            catch (Exception ex)
+            finally
             {
-                var errorEvent = StateEventHelpers.CreateErrorEvent(
-                    request.ExecutionId,
-                    nodeId,
-                    currentState,
-                    ex,
-                    previousHash
-                );
-                context.AddEvent(errorEvent);
-                yield return errorEvent;
-
-                if (!request.Options.ContinueOnError)
-                {
-                    currentState = currentState.WithStatus(WorkflowStatus.Failed, ex.Message);
-                    await _stateStore.SaveStateAsync(currentState, cancellationToken);
-
-                    var failedEvent = StateEventHelpers.CreateFailedEvent(
-                        request.ExecutionId,
-                        nodeId,
-                        currentState,
-                        ex.Message
-                    );
-                    context.AddEvent(failedEvent);
-                    yield return failedEvent;
-
-                    yield break;
-                }
+                _concurrencySemaphore.Release();
             }
         }
 
+        while (!cts.Token.IsCancellationRequested)
+        {
+            while (pendingNodes.TryDequeue(out var nodeId))
+            {
+                if (completedNodes.Contains(nodeId))
+                    continue;
+
+                if (runningTasks.Count >= request.Options.MaxConcurrency)
+                    break;
+
+                var task = ProcessNodeAsync(nodeId, cts.Token);
+                runningTasks.Add(task);
+            }
+
+            if (runningTasks.Count == 0)
+                break;
+
+            var completed = await Task.WhenAny(runningTasks.Where(t => !t.IsCanceled));
+            runningTasks.Remove(completed);
+
+            if (completed.IsFaulted && !request.Options.ContinueOnError)
+            {
+                cts.Cancel();
+                break;
+            }
+        }
+
+        await Task.WhenAll(runningTasks);
+
         var isCompleted = request.Graph.ExitNodeIds.All(exitId => completedNodes.Contains(exitId));
         currentState = currentState.WithStatus(isCompleted ? WorkflowStatus.Completed : WorkflowStatus.Failed);
-        await _stateStore.SaveStateAsync(currentState, cancellationToken);
+        await _stateStore.SaveStateAsync(currentState, cts.Token);
 
         var finalEvent = isCompleted
             ? StateEventHelpers.CreateCompletedEvent(request.ExecutionId, request.Graph.ExitNodeIds.FirstOrDefault() ?? "", currentState)
@@ -165,7 +178,10 @@ public sealed class ParallelExecutor
 
     private async Task<NodeResult> ExecuteNodeAsync(INode node, WorkflowState state, CancellationToken cancellationToken)
     {
-        return await node.ExecuteAsync(state, cancellationToken);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(node is ILlmClient ? TimeSpan.FromMinutes(2) : TimeSpan.FromSeconds(30));
+
+        return await node.ExecuteAsync(state, cts.Token);
     }
 
     public async Task<WorkflowState> RunToCompletionAsync(
