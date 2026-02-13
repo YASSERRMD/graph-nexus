@@ -1,6 +1,7 @@
 using System.Collections.Frozen;
 using GraphNexus.Graph;
 using GraphNexus.Nodes;
+using GraphNexus.Primitives;
 
 namespace GraphNexus.Graph;
 
@@ -31,7 +32,7 @@ public class GraphBuilder
         return this;
     }
 
-    public GraphBuilder Edge(string sourceId, string targetId, string? label = null, Func<Primitives.WorkflowState, bool>? predicate = null)
+    public GraphBuilder Edge(string sourceId, string targetId, string? label = null, Func<WorkflowState, bool>? predicate = null)
     {
         _edges.Add(new Edge(sourceId, targetId, label, predicate));
         return this;
@@ -58,6 +59,16 @@ public class GraphBuilder
         return this;
     }
 
+    public ForkBuilder Fork(string sourceId, params string[] targetIds)
+    {
+        return new ForkBuilder(this, sourceId, targetIds);
+    }
+
+    public JoinBuilder Join(string targetId, params string[] sourceIds)
+    {
+        return new JoinBuilder(this, targetId, sourceIds);
+    }
+
     public GraphDefinition Build()
     {
         return new GraphDefinition(
@@ -68,6 +79,72 @@ public class GraphBuilder
             _entryNodeId,
             _exitNodeIds.ToFrozenSet()
         );
+    }
+}
+
+public class ForkBuilder
+{
+    private readonly GraphBuilder _builder;
+    private readonly string _sourceId;
+    private readonly string[] _targetIds;
+
+    public ForkBuilder(GraphBuilder builder, string sourceId, string[] targetIds)
+    {
+        _builder = builder;
+        _sourceId = sourceId;
+        _targetIds = targetIds;
+    }
+
+    public GraphBuilder WithLabels(params string[] labels)
+    {
+        for (int i = 0; i < _targetIds.Length; i++)
+        {
+            var label = i < labels.Length ? labels[i] : null;
+            _builder.Edge(_sourceId, _targetIds[i], label);
+        }
+        return _builder;
+    }
+
+    public GraphBuilder WithConditions(params Func<WorkflowState, bool>[] predicates)
+    {
+        for (int i = 0; i < _targetIds.Length; i++)
+        {
+            var predicate = i < predicates.Length ? predicates[i] : null;
+            _builder.Edge(_sourceId, _targetIds[i], predicate: predicate);
+        }
+        return _builder;
+    }
+
+    public GraphBuilder WithConditionsAndLabels((string Label, Func<WorkflowState, bool> Predicate)[] edges)
+    {
+        foreach (var (label, predicate) in edges)
+        {
+            _builder.Edge(_sourceId, label, predicate: predicate);
+        }
+        return _builder;
+    }
+}
+
+public class JoinBuilder
+{
+    private readonly GraphBuilder _builder;
+    private readonly string _targetId;
+    private readonly string[] _sourceIds;
+
+    public JoinBuilder(GraphBuilder builder, string targetId, string[] sourceIds)
+    {
+        _builder = builder;
+        _targetId = targetId;
+        _sourceIds = sourceIds;
+    }
+
+    public GraphBuilder WithLabel(string? label = null)
+    {
+        foreach (var sourceId in _sourceIds)
+        {
+            _builder.Edge(sourceId, _targetId, label);
+        }
+        return _builder;
     }
 }
 
@@ -100,6 +177,20 @@ public static class GraphBuilderExtensions
     public static GraphBuilder To(this string targetId, GraphBuilder builder, string sourceId)
     {
         builder.Edge(sourceId, targetId);
+        return builder;
+    }
+
+    public static GraphBuilder Parallel(
+        this GraphBuilder builder,
+        string sourceId,
+        IReadOnlyList<string> parallelNodeIds,
+        string joinNodeId)
+    {
+        foreach (var nodeId in parallelNodeIds)
+        {
+            builder.Edge(sourceId, nodeId);
+            builder.Edge(nodeId, joinNodeId);
+        }
         return builder;
     }
 }
