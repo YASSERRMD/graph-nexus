@@ -1,5 +1,5 @@
-using System.Threading.Channels;
-using GraphNexus.Execution;
+using System.Runtime.ExceptionServices;
+using GraphNexus.Execution.Resilience;
 using GraphNexus.Graph;
 using GraphNexus.Nodes;
 using GraphNexus.Primitives;
@@ -10,11 +10,22 @@ public sealed class ParallelExecutor
 {
     private readonly IStateStore _stateStore;
     private readonly SemaphoreSlim _concurrencySemaphore;
+    private readonly RetryPolicy _retryPolicy;
+    private readonly CircuitBreakerRegistry _circuitBreakerRegistry;
+    private readonly ILogger? _logger;
 
-    public ParallelExecutor(IStateStore stateStore, int maxConcurrency = 4)
+    public ParallelExecutor(
+        IStateStore stateStore,
+        int maxConcurrency = 4,
+        RetryPolicy? retryPolicy = null,
+        CircuitBreakerRegistry? circuitBreakerRegistry = null,
+        ILogger? logger = null)
     {
         _stateStore = stateStore;
         _concurrencySemaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+        _retryPolicy = retryPolicy ?? new RetryPolicy();
+        _circuitBreakerRegistry = circuitBreakerRegistry ?? new CircuitBreakerRegistry();
+        _logger = logger;
     }
 
     public async IAsyncEnumerable<StateEvent> RunAsync(
@@ -65,7 +76,7 @@ public sealed class ParallelExecutor
 
                 try
                 {
-                    var result = await ExecuteNodeAsync(node, currentState, ct);
+                    var result = await ExecuteNodeWithRetryAsync(node, currentState, ct, request.Options);
 
                     if (result is SuccessResult success)
                     {
@@ -102,6 +113,8 @@ public sealed class ParallelExecutor
                         );
                         context.AddEvent(errorEvent);
 
+                        _logger?.LogError("Node {NodeId} failed: {Error}", nodeId, failure.Error ?? failure.Reason);
+
                         if (!request.Options.ContinueOnError)
                         {
                             cts.Cancel();
@@ -122,6 +135,8 @@ public sealed class ParallelExecutor
                         previousHash
                     );
                     context.AddEvent(errorEvent);
+
+                    _logger?.LogError(ex, "Node {NodeId} threw exception", nodeId);
 
                     if (!request.Options.ContinueOnError)
                     {
@@ -176,12 +191,90 @@ public sealed class ParallelExecutor
         yield return finalEvent;
     }
 
-    private async Task<NodeResult> ExecuteNodeAsync(INode node, WorkflowState state, CancellationToken cancellationToken)
+    private async Task<NodeResult> ExecuteNodeWithRetryAsync(
+        INode node,
+        WorkflowState state,
+        CancellationToken cancellationToken,
+        ExecutionOptions options)
     {
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(node is ILlmClient ? TimeSpan.FromMinutes(2) : TimeSpan.FromSeconds(30));
+        var isLlmNode = node is LlmNode;
+        var timeout = isLlmNode ? options.LlmNodeTimeout : options.NodeTimeout;
 
+        if (options.EnableRetry)
+        {
+            return await _retryPolicy.ExecuteAsync(
+                async (attempt, ct) =>
+                {
+                    var nodeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    nodeCts.CancelAfter(timeout);
+
+                    try
+                    {
+                        var result = await node.ExecuteAsync(state, nodeCts.Token);
+
+                        if (options.EnableCircuitBreaker && isLlmNode)
+                        {
+                            var circuitBreaker = _circuitBreakerRegistry.GetOrCreate("llm");
+                            return await circuitBreaker.ExecuteAsync(async ct2 =>
+                            {
+                                var result2 = await node.ExecuteAsync(state, ct2);
+
+                                if (result2 is FailureResult failure && IsTransientFailure(failure))
+                                {
+                                    throw new TransientFailureException(failure.Error ?? failure.Reason);
+                                }
+
+                                return result2;
+                            }, ct);
+                        }
+
+                        return result;
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                    {
+                        throw new TimeoutException($"Node execution timed out after {timeout}");
+                    }
+                    catch (TransientFailureException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex) when (IsTransientException(ex))
+                    {
+                        _logger?.LogWarning(ex, "Transient error executing node {NodeId}, attempt {Attempt}", node.Id, attempt + 1);
+                        throw;
+                    }
+                    finally
+                    {
+                        nodeCts.Dispose();
+                    }
+                },
+                cancellationToken,
+                attempt => _logger?.LogInformation("Retrying node {NodeId}, attempt {Attempt}/{MaxRetries}",
+                    node.Id, attempt.AttemptNumber, attempt.MaxRetries));
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(timeout);
         return await node.ExecuteAsync(state, cts.Token);
+    }
+
+    private static bool IsTransientFailure(FailureResult failure)
+    {
+        var error = failure.Error ?? failure.Reason;
+        return error != null && (
+            error.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
+            error.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ||
+            error.Contains("429", StringComparison.OrdinalIgnoreCase) ||
+            error.Contains("503", StringComparison.OrdinalIgnoreCase) ||
+            error.Contains("temporary", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsTransientException(Exception ex)
+    {
+        return ex is TimeoutException ||
+               ex is HttpRequestException ||
+               ex is IOException ||
+               (ex is OperationCanceledException && ex.Message.Contains("timeout"));
     }
 
     public async Task<WorkflowState> RunToCompletionAsync(
@@ -197,4 +290,28 @@ public sealed class ParallelExecutor
 
         return finalState;
     }
+}
+
+public sealed class TransientFailureException : Exception
+{
+    public TransientFailureException(string message) : base(message) { }
+}
+
+public interface ILogger
+{
+    void LogInformation(string message, params object[] args);
+    void LogWarning(string message, params object[] args);
+    void LogWarning(Exception ex, string message, params object[] args);
+    void LogError(string message, params object[] args);
+    void LogError(Exception ex, string message, params object[] args);
+}
+
+public sealed class NoOpLogger : ILogger
+{
+    public static readonly NoOpLogger Instance = new();
+    public void LogInformation(string message, params object[] args) { }
+    public void LogWarning(string message, params object[] args) { }
+    public void LogWarning(Exception ex, string message, params object[] args) { }
+    public void LogError(string message, params object[] args) { }
+    public void LogError(Exception ex, string message, params object[] args) { }
 }

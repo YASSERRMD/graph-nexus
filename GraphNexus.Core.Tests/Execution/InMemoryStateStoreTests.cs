@@ -125,4 +125,68 @@ public class InMemoryStateStoreTests
 
         Assert.Equal(100, (await store.GetStatesByWorkflowIdAsync("workflow-0")).Count);
     }
+
+    [Fact]
+    public async Task ConcurrentReadsAndWrites_ShouldBeThreadSafe()
+    {
+        var store = new InMemoryStateStore();
+        var states = Enumerable.Range(0, 50)
+            .Select(i => WorkflowState.Create($"workflow-{i}"))
+            .ToList();
+
+        foreach (var state in states)
+        {
+            await store.SaveStateAsync(state);
+        }
+
+        var readTasks = Enumerable.Range(0, 100)
+            .Select(async _ =>
+            {
+                var random = new Random();
+                var workflowId = $"workflow-{random.Next(50)}";
+                return await store.GetStatesByWorkflowIdAsync(workflowId);
+            });
+
+        var writeTasks = Enumerable.Range(0, 50)
+            .Select(async i =>
+            {
+                var state = WorkflowState.Create($"new-workflow-{i}");
+                await store.SaveStateAsync(state);
+            });
+
+        await Task.WhenAll(readTasks.Concat(writeTasks));
+
+        Assert.True(true);
+    }
+
+    [Fact]
+    public async Task ConcurrentDeleteAndRead_ShouldNotThrow()
+    {
+        var store = new InMemoryStateStore();
+        var state = WorkflowState.Create("workflow-1");
+        await store.SaveStateAsync(state);
+
+        var deleteTask = store.DeleteStateAsync(state.Id);
+        var readTask = store.GetStateAsync(state.Id);
+
+        await Task.WhenAll(deleteTask, readTask);
+
+        var result = await readTask;
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task ConcurrentExistsChecks_ShouldBeConsistent()
+    {
+        var store = new InMemoryStateStore();
+        var state = WorkflowState.Create("workflow-1");
+        await store.SaveStateAsync(state);
+
+        var tasks = Enumerable.Range(0, 100)
+            .Select(_ => store.ExistsAsync(state.Id));
+
+        var results = await Task.WhenAll(tasks);
+
+        Assert.All(results, r => Assert.True(r));
+    }
 }

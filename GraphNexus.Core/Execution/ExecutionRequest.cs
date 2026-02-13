@@ -19,6 +19,18 @@ public sealed record ExecutionOptions
     public int MaxRetries { get; init; } = 3;
     public TimeSpan Timeout { get; init; } = TimeSpan.FromMinutes(5);
     public bool ContinueOnError { get; init; } = false;
+    public TimeSpan NodeTimeout { get; init; } = TimeSpan.FromSeconds(30);
+    public TimeSpan LlmNodeTimeout { get; init; } = TimeSpan.FromMinutes(2);
+    public bool EnableRetry { get; init; } = true;
+    public bool EnableCircuitBreaker { get; init; } = true;
+}
+
+public sealed record NodeExecutionOptions
+{
+    public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(30);
+    public int MaxRetries { get; init; } = 3;
+    public bool EnableRetry { get; init; } = true;
+    public bool EnableCircuitBreaker { get; init; } = true;
 }
 
 public sealed record NodeExecutionRequest
